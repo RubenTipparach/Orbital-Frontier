@@ -25,7 +25,7 @@ void renderer_init(Renderer* r, float planet_radius) {
             },
         },
         .index_type = SG_INDEXTYPE_UINT16,
-        .cull_mode = SG_CULLMODE_BACK,
+        .cull_mode = SG_CULLMODE_NONE,  // TODO: fix winding order then use BACK
         .depth = {
             .write_enabled = true,
             .compare = SG_COMPAREFUNC_LESS_EQUAL,
@@ -39,21 +39,23 @@ void renderer_frame(Renderer* r, Camera* cam, LodTree* lod, float dt) {
     r->sun_angle += dt * 0.02f; // slow orbit
 
     // Compute sun direction
-    HMM_Vec4 sun_dir = HMM_V4(cosf(r->sun_angle), 0.3f, sinf(r->sun_angle), 0.0f);
-    sun_dir.X /= HMM_LenV3(sun_dir.XYZ);
-    sun_dir.Y /= HMM_LenV3(sun_dir.XYZ);
-    sun_dir.Z /= HMM_LenV3(sun_dir.XYZ);
+    HMM_Vec3 sun_raw = HMM_V3(cosf(r->sun_angle), 0.3f, sinf(r->sun_angle));
+    HMM_Vec3 sun_norm = HMM_NormV3(sun_raw);
+    HMM_Vec4 sun_dir = HMM_V4(sun_norm.X, sun_norm.Y, sun_norm.Z, 0.0f);
 
     // Camera offset for camera-relative rendering
     HMM_Vec4 cam_offset, cam_offset_low;
     camera_get_offset(cam, &cam_offset, &cam_offset_low);
 
-    // Log depth parameters
+    // Logarithmic depth buffer for planetary scale
     float far_plane = r->planet_radius * 20.0f;
-    float Fcoef = 2.0f / log2f(far_plane + 1.0f);
 #if defined(SOKOL_GLCORE) || defined(SOKOL_GLES3)
+    // GL NDC: z in [-1, 1]. Fcoef maps log2(1+far) to 1, z_bias shifts to [-1,1]
+    float Fcoef = 2.0f / log2f(far_plane + 1.0f);
     float z_bias = -1.0f;
 #else
+    // D3D11/Metal/WebGPU NDC: z in [0, 1]. Fcoef maps log2(1+far) to 1
+    float Fcoef = 1.0f / log2f(far_plane + 1.0f);
     float z_bias = 0.0f;
 #endif
     HMM_Vec4 log_depth = HMM_V4(Fcoef, far_plane, z_bias, 0.0f);
@@ -78,9 +80,17 @@ void renderer_frame(Renderer* r, Camera* cam, LodTree* lod, float dt) {
 
     double alt = sqrt(cam->pos_d[0]*cam->pos_d[0] + cam->pos_d[1]*cam->pos_d[1] + cam->pos_d[2]*cam->pos_d[2]);
     double surface_alt = alt - (double)r->planet_radius;
+
+    // Count active leaves for debug
+    int active_leaves = 0;
+    for (int i = 0; i < lod->node_count; i++) {
+        if (lod->nodes[i].state == LOD_ACTIVE && lod->nodes[i].children[0] < 0)
+            active_leaves++;
+    }
+
     sdtx_printf("Orbital Frontier\n");
-    sdtx_printf("Alt: %.1f km  Speed: %.0f m/s\n", surface_alt / 1000.0, (double)cam->speed);
-    sdtx_printf("Nodes: %d  FPS: %.0f\n", lod->node_count, 1.0f / (dt > 0.0001f ? dt : 0.016f));
+    sdtx_printf("Alt: %.1f km  Speed: %.0f km/s\n", surface_alt / 1000.0, (double)cam->speed / 1000.0);
+    sdtx_printf("Nodes: %d  Active: %d  FPS: %.0f\n", lod->node_count, active_leaves, 1.0f / (dt > 0.0001f ? dt : 0.016f));
     sdtx_draw();
 
     sg_end_pass();

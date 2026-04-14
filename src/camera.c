@@ -18,20 +18,21 @@ void camera_get_offset(const Camera* cam, HMM_Vec4* offset_high, HMM_Vec4* offse
 void camera_init(Camera* cam, double start_altitude) {
     *cam = (Camera){0};
 
-    // Start above the planet surface, looking down
+    // Start above the planet, looking toward it
     cam->pos_d[0] = 0.0;
     cam->pos_d[1] = start_altitude;
     cam->pos_d[2] = 0.0;
 
     cam->position = HMM_V3(0.0f, (float)start_altitude, 0.0f);
-    cam->local_up = HMM_NormV3(cam->position);
-    cam->up = cam->local_up;
-    cam->forward = HMM_V3(0.0f, 0.0f, -1.0f);
-    cam->right = HMM_V3(1.0f, 0.0f, 0.0f);
+    cam->local_up = HMM_V3(0.0f, 1.0f, 0.0f);
+    // Look toward planet at a slight angle so up/forward aren't antiparallel
+    cam->forward = HMM_NormV3(HMM_V3(0.0f, -0.95f, -0.3f));
+    cam->up = HMM_V3(0.0f, 0.0f, 1.0f);         // Z-up for this viewing angle
+    cam->right = HMM_NormV3(HMM_Cross(cam->forward, cam->up));
 
     cam->yaw = 0.0f;
     cam->pitch = 0.0f;
-    cam->speed = 500.0f;
+    cam->speed = 50000.0f;   // 50 km/s default at orbital scale
     cam->sensitivity = 0.002f;
     cam->mouse_locked = false;
     cam->space_mode = true;
@@ -39,6 +40,10 @@ void camera_init(Camera* cam, double start_altitude) {
     cam->roll = 0.0f;
     cam->space_up = cam->up;
     cam->space_forward = cam->forward;
+
+    // Ensure orthonormal basis
+    cam->right = HMM_NormV3(HMM_Cross(cam->forward, cam->up));
+    cam->up = HMM_NormV3(HMM_Cross(cam->right, cam->forward));
 }
 
 static void update_space_mode(Camera* cam, float dt) {
@@ -117,13 +122,19 @@ void camera_update(Camera* cam, float dt, double planet_radius) {
         cam->local_up = HMM_MulV3F(cam->position, 1.0f / pos_len);
     }
 
-    // Build view matrix
-    HMM_Vec3 target = HMM_AddV3(cam->position, cam->forward);
-    cam->view = HMM_LookAt_RH(cam->position, target, cam->up);
+    // Build view matrix — centered at origin since vertices are camera-relative
+    // LookAt expects (eye, target, up) — target must be a point, not a direction
+    HMM_Vec3 origin = HMM_V3(0, 0, 0);
+    HMM_Vec3 target = cam->forward; // unit vector = point 1m along forward from origin
+    cam->view = HMM_LookAt_RH(origin, target, cam->up);
 
-    // Build projection matrix
+    // Build projection matrix (ZO for D3D11/Metal/WebGPU, NO for OpenGL)
     float aspect = sapp_widthf() / sapp_heightf();
-    cam->proj = HMM_Perspective_RH_NO(HMM_AngleDeg(60.0f), aspect, 0.1f, 1e7f);
+#if defined(SOKOL_GLCORE) || defined(SOKOL_GLES3)
+    cam->proj = HMM_Perspective_RH_NO(HMM_AngleDeg(60.0f), aspect, 1.0f, 1e8f);
+#else
+    cam->proj = HMM_Perspective_RH_ZO(HMM_AngleDeg(60.0f), aspect, 1.0f, 1e8f);
+#endif
 }
 
 void camera_handle_event(Camera* cam, const sapp_event* ev) {

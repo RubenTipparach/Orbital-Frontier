@@ -15,3 +15,5 @@ cache/
 *.user
 CMakeUserPresets.json
 third_party/
+.history/
+debug.log

@@ -42,6 +42,7 @@ endif()
 # Main executable
 add_executable(orbital-frontier
     src/main.c
+    src/debug_log.c
     src/camera.c
     src/render.c
     src/lod.c
@@ -61,9 +62,10 @@ target_include_directories(orbital-frontier PRIVATE
 
 target_link_libraries(orbital-frontier PRIVATE sokol)
 
-if(WIN32)
-    set_target_properties(orbital-frontier PROPERTIES WIN32_EXECUTABLE TRUE)
-endif()
+# Enable console window for debug output (disable for release)
+# if(WIN32)
+#     set_target_properties(orbital-frontier PROPERTIES WIN32_EXECUTABLE TRUE)
+# endif()
 
 # ---- Shader compilation with sokol-shdc ----
 set(SOKOL_SHDC "${CMAKE_SOURCE_DIR}/tools/sokol-shdc${CMAKE_EXECUTABLE_SUFFIX}")

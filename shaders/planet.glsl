@@ -27,10 +27,13 @@ void main() {
     gl_Position = mvp * vec4(cam_rel_pos, 1.0);
 
     // Logarithmic depth buffer
+    // Maps depth to [0,1] for D3D11/Metal/WebGPU or [-1,1] for GL
     float Fcoef = log_depth.x;
     if (Fcoef > 0.0) {
         float w = gl_Position.w;
-        gl_Position.z = (log2(max(1e-6, 1.0 + w)) * Fcoef + log_depth.z) * w;
+        float z_log = log2(max(1e-6, 1.0 + w)) * Fcoef;
+        // z_bias = -1 for GL (remap [0,1] to [-1,1]), 0 for D3D11/Metal/WebGPU
+        gl_Position.z = (z_log + log_depth.z) * w;
     }
 
     fs_normal = a_normal;

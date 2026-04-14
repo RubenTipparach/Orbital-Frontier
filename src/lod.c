@@ -395,13 +395,17 @@ void lod_tree_render(const LodTree* tree, sg_pipeline pip,
 
     for (int i = 0; i < tree->node_count; i++) {
         const LodNode* node = &tree->nodes[i];
-        if (node->state != LOD_ACTIVE || !node->gpu_valid) continue;
+        if (!node->gpu_valid) continue;
         if (!is_leaf(node)) continue; // only render leaves
+        if (node->index_count <= 0) continue;
 
-        sg_apply_bindings(&(sg_bindings){
-            .vertex_buffers[0] = node->vbuf,
-            .index_buffer = node->ibuf,
-        });
+        // Validate buffer handles before binding
+        if (node->vbuf.id == 0 || node->ibuf.id == 0) continue;
+
+        sg_bindings bind = {0};
+        bind.vertex_buffers[0] = node->vbuf;
+        bind.index_buffer = node->ibuf;
+        sg_apply_bindings(&bind);
 
         // VS uniforms
         struct {
