@@ -12,6 +12,7 @@
 #include "camera.h"
 #include "render.h"
 #include "lod.h"
+#include "screenshot.h"
 
 #include <stdio.h>
 #include <math.h>
@@ -34,11 +35,11 @@ static void init(void) {
     debug_log("Initializing Orbital Frontier...");
 
     // Init sokol_gfx with large buffer pool for LOD
-    debug_log("Setting up sokol_gfx (buffer_pool=4096)");
+    debug_log("Setting up sokol_gfx (buffer_pool=16384)");
     sg_setup(&(sg_desc){
         .environment = sglue_environment(),
         .logger = { .func = debug_sokol_logger },
-        .buffer_pool_size = 4096,
+        .buffer_pool_size = 16384,
         .pipeline_pool_size = 32,
         .shader_pool_size = 32,
         // validation enabled — catches bad bindings early
@@ -62,19 +63,19 @@ static void init(void) {
         .logger = { .func = debug_sokol_logger },
     });
 
-    // Init camera
+    // Init LOD tree (before camera, so terrain is available for collision)
+    debug_log("Initializing LOD tree (radius=%.0f, seed=%d)", (double)PLANET_RADIUS, TERRAIN_SEED);
+    lod_tree_init(&state.lod, PLANET_RADIUS, TERRAIN_SEED);
+    debug_log("LOD tree created: %d root nodes", LOD_ROOT_COUNT);
+
+    // Init camera with terrain collision
     double start_alt = (double)PLANET_RADIUS * START_ALTITUDE_FACTOR;
-    camera_init(&state.camera, start_alt);
+    camera_init(&state.camera, start_alt, PLANET_RADIUS, &state.lod.terrain);
     debug_log("Camera initialized at altitude %.0f km", (start_alt - PLANET_RADIUS) / 1000.0);
     debug_log("  pos: (%.0f, %.0f, %.0f)", state.camera.pos_d[0], state.camera.pos_d[1], state.camera.pos_d[2]);
     debug_log("  forward: (%.3f, %.3f, %.3f)", (double)state.camera.forward.X, (double)state.camera.forward.Y, (double)state.camera.forward.Z);
     debug_log("  up: (%.3f, %.3f, %.3f)", (double)state.camera.up.X, (double)state.camera.up.Y, (double)state.camera.up.Z);
     debug_log("  right: (%.3f, %.3f, %.3f)", (double)state.camera.right.X, (double)state.camera.right.Y, (double)state.camera.right.Z);
-
-    // Init LOD tree
-    debug_log("Initializing LOD tree (radius=%.0f, seed=%d)", (double)PLANET_RADIUS, TERRAIN_SEED);
-    lod_tree_init(&state.lod, PLANET_RADIUS, TERRAIN_SEED);
-    debug_log("LOD tree created: %d root nodes", LOD_ROOT_COUNT);
 
     // Init renderer
     debug_log("Initializing renderer");
@@ -133,10 +134,10 @@ static void frame(void) {
             // Log a few node positions
             for (int i = 0; i < 3 && i < state.lod.node_count; i++) {
                 LodNode* n = &state.lod.nodes[i];
-                debug_log("  node[%d] depth=%d state=%d center=(%.3f,%.3f,%.3f) arc=%.4f children=(%d,%d,%d,%d)",
+                debug_log("  node[%d] depth=%d state=%d center=(%.3f,%.3f,%.3f) ar=%.4f leaf=%d ch=(%d,%d,%d,%d)",
                           i, n->depth, n->state,
-                          (double)n->center.X, (double)n->center.Y, (double)n->center.Z,
-                          (double)n->arc,
+                          (double)n->tri.center.X, (double)n->tri.center.Y, (double)n->tri.center.Z,
+                          (double)n->tri.angular_radius, n->is_leaf,
                           n->children[0], n->children[1], n->children[2], n->children[3]);
             }
         }
@@ -148,6 +149,9 @@ static void event(const sapp_event* ev) {
 
     // Log key events for debugging
     if (ev->type == SAPP_EVENTTYPE_KEY_DOWN) {
+        if (ev->key_code == SAPP_KEYCODE_F5 && (ev->modifiers & SAPP_MODIFIER_CTRL)) {
+            screenshot_capture();
+        }
         if (ev->key_code == SAPP_KEYCODE_F1) {
             debug_log("--- F1 Debug Dump ---");
             debug_log("Camera pos: (%.2f, %.2f, %.2f)",
@@ -166,6 +170,19 @@ static void event(const sapp_event* ev) {
             debug_log("  [%.4f %.4f %.4f %.4f]", (double)v.Elements[1][0], (double)v.Elements[1][1], (double)v.Elements[1][2], (double)v.Elements[1][3]);
             debug_log("  [%.4f %.4f %.4f %.4f]", (double)v.Elements[2][0], (double)v.Elements[2][1], (double)v.Elements[2][2], (double)v.Elements[2][3]);
             debug_log("  [%.4f %.4f %.4f %.4f]", (double)v.Elements[3][0], (double)v.Elements[3][1], (double)v.Elements[3][2], (double)v.Elements[3][3]);
+
+            // Per-depth stats
+            for (int d = 0; d <= LOD_MAX_DEPTH; d++) {
+                if (state.lod.level_stats[d].patch_count > 0) {
+                    debug_log("  depth %d: %d patches, %dk verts",
+                              d, state.lod.level_stats[d].patch_count,
+                              state.lod.level_stats[d].vertex_count / 1000);
+                }
+            }
+        }
+        if (ev->key_code == SAPP_KEYCODE_L) {
+            state.lod.show_lod_debug = !state.lod.show_lod_debug;
+            debug_log("LOD debug: %s", state.lod.show_lod_debug ? "ON" : "OFF");
         }
     }
 }

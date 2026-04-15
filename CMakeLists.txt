@@ -48,6 +48,7 @@ add_executable(orbital-frontier
     src/lod.c
     src/terrain_noise.c
     src/job_system.c
+    src/screenshot.c
 )
 if(APPLE)
     # Add macOS-specific sources here if needed

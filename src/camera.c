@@ -1,71 +1,50 @@
 #include "camera.h"
 #include <math.h>
 
-void camera_split_double(double val, float* high, float* low) {
-    *high = (float)val;
-    *low = (float)(val - (double)*high);
-}
-
-void camera_get_offset(const Camera* cam, HMM_Vec4* offset_high, HMM_Vec4* offset_low) {
-    float hx, lx, hy, ly, hz, lz;
-    camera_split_double(cam->pos_d[0], &hx, &lx);
-    camera_split_double(cam->pos_d[1], &hy, &ly);
-    camera_split_double(cam->pos_d[2], &hz, &lz);
-    *offset_high = HMM_V4(hx, hy, hz, 0.0f);
-    *offset_low  = HMM_V4(lx, ly, lz, 0.0f);
-}
-
-void camera_init(Camera* cam, double start_altitude) {
+void camera_init(Camera* cam, double start_altitude, float planet_radius, TerrainNoise* terrain) {
     *cam = (Camera){0};
 
-    // Start above the planet, looking toward it
     cam->pos_d[0] = 0.0;
     cam->pos_d[1] = start_altitude;
     cam->pos_d[2] = 0.0;
 
     cam->position = HMM_V3(0.0f, (float)start_altitude, 0.0f);
     cam->local_up = HMM_V3(0.0f, 1.0f, 0.0f);
-    // Look toward planet at a slight angle so up/forward aren't antiparallel
-    cam->forward = HMM_NormV3(HMM_V3(0.0f, -0.95f, -0.3f));
-    cam->up = HMM_V3(0.0f, 0.0f, 1.0f);         // Z-up for this viewing angle
-    cam->right = HMM_NormV3(HMM_Cross(cam->forward, cam->up));
 
-    cam->yaw = 0.0f;
-    cam->pitch = 0.0f;
-    cam->speed = 50000.0f;   // 50 km/s default at orbital scale
+    // Look toward planet at a slight angle
+    cam->forward = HMM_NormV3(HMM_V3(0.0f, -0.95f, -0.3f));
+    cam->up = HMM_V3(0.0f, 0.0f, 1.0f);
+    cam->right = HMM_NormV3(HMM_Cross(cam->forward, cam->up));
+    cam->up = HMM_NormV3(HMM_Cross(cam->right, cam->forward));
+
+    cam->speed = 50000.0f;
     cam->sensitivity = 0.002f;
-    cam->mouse_locked = false;
     cam->space_mode = true;
-    cam->tangent_initialized = false;
-    cam->roll = 0.0f;
     cam->space_up = cam->up;
     cam->space_forward = cam->forward;
 
-    // Ensure orthonormal basis
-    cam->right = HMM_NormV3(HMM_Cross(cam->forward, cam->up));
-    cam->up = HMM_NormV3(HMM_Cross(cam->right, cam->forward));
+    cam->terrain = terrain;
+    cam->planet_radius = planet_radius;
+    cam->min_altitude = 5.0f;  // 5m clearance above terrain
 }
 
 static void update_space_mode(Camera* cam, float dt) {
-    // Apply mouse look
     float dyaw = -cam->mouse_dx_accum * cam->sensitivity;
     float dpitch = -cam->mouse_dy_accum * cam->sensitivity;
     cam->mouse_dx_accum = 0.0f;
     cam->mouse_dy_accum = 0.0f;
 
-    // Roll from Q/E
     float droll = 0.0f;
     if (cam->key_q) droll -= 2.0f * dt;
     if (cam->key_e) droll += 2.0f * dt;
 
-    // Rotate forward around up (yaw)
+    // Yaw around up
     HMM_Mat4 yaw_rot = HMM_Rotate_RH(dyaw, cam->space_up);
     cam->space_forward = HMM_NormV3(HMM_MulM4V4(yaw_rot, HMM_V4V(cam->space_forward, 0.0f)).XYZ);
 
-    // Compute right from forward x up
     HMM_Vec3 right = HMM_NormV3(HMM_Cross(cam->space_forward, cam->space_up));
 
-    // Rotate forward around right (pitch)
+    // Pitch around right
     HMM_Mat4 pitch_rot = HMM_Rotate_RH(dpitch, right);
     cam->space_forward = HMM_NormV3(HMM_MulM4V4(pitch_rot, HMM_V4V(cam->space_forward, 0.0f)).XYZ);
     cam->space_up = HMM_NormV3(HMM_MulM4V4(pitch_rot, HMM_V4V(cam->space_up, 0.0f)).XYZ);
@@ -76,13 +55,12 @@ static void update_space_mode(Camera* cam, float dt) {
         cam->space_up = HMM_NormV3(HMM_MulM4V4(roll_rot, HMM_V4V(cam->space_up, 0.0f)).XYZ);
     }
 
-    // Recompute basis
     right = HMM_NormV3(HMM_Cross(cam->space_forward, cam->space_up));
     cam->forward = cam->space_forward;
     cam->right = right;
     cam->up = cam->space_up;
 
-    // Movement
+    // Movement (double precision accumulation)
     HMM_Vec3 move = HMM_V3(0, 0, 0);
     if (cam->key_w) move = HMM_AddV3(move, cam->forward);
     if (cam->key_s) move = HMM_SubV3(move, cam->forward);
@@ -94,47 +72,107 @@ static void update_space_mode(Camera* cam, float dt) {
     float move_len = HMM_LenV3(move);
     if (move_len > 0.001f) {
         move = HMM_MulV3F(move, 1.0f / move_len);
-        double dx = (double)(move.X * cam->speed * dt);
-        double dy = (double)(move.Y * cam->speed * dt);
-        double dz = (double)(move.Z * cam->speed * dt);
-        cam->pos_d[0] += dx;
-        cam->pos_d[1] += dy;
-        cam->pos_d[2] += dz;
+        cam->pos_d[0] += (double)(move.X * cam->speed * dt);
+        cam->pos_d[1] += (double)(move.Y * cam->speed * dt);
+        cam->pos_d[2] += (double)(move.Z * cam->speed * dt);
     }
 
-    // Sync float position from double
     cam->position = HMM_V3((float)cam->pos_d[0], (float)cam->pos_d[1], (float)cam->pos_d[2]);
 }
 
 void camera_update(Camera* cam, float dt, double planet_radius) {
-    (void)planet_radius;
-
     if (!cam->mouse_locked) {
         cam->mouse_dx_accum = 0.0f;
         cam->mouse_dy_accum = 0.0f;
     }
 
+    // Height-based speed: scales from ~10 m/s at surface to ~500 km/s in high orbit
+    // altitude_above_surface is in meters
+    double dist_from_center = sqrt(cam->pos_d[0]*cam->pos_d[0] +
+                                   cam->pos_d[1]*cam->pos_d[1] +
+                                   cam->pos_d[2]*cam->pos_d[2]);
+    double altitude_above_surface = dist_from_center - (double)planet_radius;
+    if (altitude_above_surface < 0.0) altitude_above_surface = 0.0;
+
+    // Logarithmic speed curve: at 0m -> 10 m/s, at 1km -> ~100 m/s,
+    // at 100km -> ~50,000 m/s, at 1600km (2x radius) -> ~500,000 m/s
+    float base_speed = 10.0f + (float)(altitude_above_surface * 0.3);
+    if (base_speed > 500000.0f) base_speed = 500000.0f;
+    cam->speed = base_speed;
+
     update_space_mode(cam, dt);
 
-    // Update local_up (radial direction on sphere)
+    // Terrain collision: sample terrain height at camera position, push above it
+    if (cam->terrain) {
+        double cam_dist = sqrt(cam->pos_d[0]*cam->pos_d[0] +
+                               cam->pos_d[1]*cam->pos_d[1] +
+                               cam->pos_d[2]*cam->pos_d[2]);
+        if (cam_dist > 0.001) {
+            // Unit direction from planet center
+            float ux = (float)(cam->pos_d[0] / cam_dist);
+            float uy = (float)(cam->pos_d[1] / cam_dist);
+            float uz = (float)(cam->pos_d[2] / cam_dist);
+
+            // Sample terrain height at this point on the sphere
+            float terrain_h = terrain_sample_height_m(cam->terrain, ux, uy, uz);
+            float terrain_radius = cam->planet_radius + terrain_h;
+            float min_radius = terrain_radius + cam->min_altitude;
+
+            cam->altitude = (float)(cam_dist - (double)terrain_radius);
+
+            if ((float)cam_dist < min_radius) {
+                // Push camera out to minimum altitude
+                double scale = (double)min_radius / cam_dist;
+                cam->pos_d[0] *= scale;
+                cam->pos_d[1] *= scale;
+                cam->pos_d[2] *= scale;
+                cam->altitude = cam->min_altitude;
+            }
+        }
+
+        cam->position = HMM_V3((float)cam->pos_d[0], (float)cam->pos_d[1], (float)cam->pos_d[2]);
+    }
+
+    // Local up = radial direction on sphere
     float pos_len = HMM_LenV3(cam->position);
     if (pos_len > 0.001f) {
         cam->local_up = HMM_MulV3F(cam->position, 1.0f / pos_len);
     }
 
-    // Build view matrix — centered at origin since vertices are camera-relative
-    // LookAt expects (eye, target, up) — target must be a point, not a direction
-    HMM_Vec3 origin = HMM_V3(0, 0, 0);
-    HMM_Vec3 target = cam->forward; // unit vector = point 1m along forward from origin
-    cam->view = HMM_LookAt_RH(origin, target, cam->up);
+    // Build view matrix DIRECTLY from basis vectors (matches hex-planets).
+    // AVOID HMM_LookAt_RH — it does normalize(target-eye) internally,
+    // which loses precision at 800km due to float cancellation.
+    {
+        HMM_Vec3 F = cam->forward;
+        HMM_Vec3 S = HMM_NormV3(HMM_Cross(F, cam->up));
+        HMM_Vec3 U = HMM_Cross(S, F);
 
-    // Build projection matrix (ZO for D3D11/Metal/WebGPU, NO for OpenGL)
+        cam->view.Elements[0][0] = S.X;
+        cam->view.Elements[0][1] = U.X;
+        cam->view.Elements[0][2] = -F.X;
+        cam->view.Elements[0][3] = 0.0f;
+
+        cam->view.Elements[1][0] = S.Y;
+        cam->view.Elements[1][1] = U.Y;
+        cam->view.Elements[1][2] = -F.Y;
+        cam->view.Elements[1][3] = 0.0f;
+
+        cam->view.Elements[2][0] = S.Z;
+        cam->view.Elements[2][1] = U.Z;
+        cam->view.Elements[2][2] = -F.Z;
+        cam->view.Elements[2][3] = 0.0f;
+
+        // Translation row (will be zeroed for camera-relative rendering in render.c)
+        cam->view.Elements[3][0] = -HMM_DotV3(S, cam->position);
+        cam->view.Elements[3][1] = -HMM_DotV3(U, cam->position);
+        cam->view.Elements[3][2] = HMM_DotV3(F, cam->position);
+        cam->view.Elements[3][3] = 1.0f;
+    }
+
+    // Projection: RH_NO for ALL backends (log depth overrides z anyway)
+    // Matches hex-planets: 70 FOV, 0.01 near, 10M far
     float aspect = sapp_widthf() / sapp_heightf();
-#if defined(SOKOL_GLCORE) || defined(SOKOL_GLES3)
-    cam->proj = HMM_Perspective_RH_NO(HMM_AngleDeg(60.0f), aspect, 1.0f, 1e8f);
-#else
-    cam->proj = HMM_Perspective_RH_ZO(HMM_AngleDeg(60.0f), aspect, 1.0f, 1e8f);
-#endif
+    cam->proj = HMM_Perspective_RH_NO(HMM_AngleDeg(70.0f), aspect, 0.01f, 10000000.0f);
 }
 
 void camera_handle_event(Camera* cam, const sapp_event* ev) {
@@ -168,10 +206,10 @@ void camera_handle_event(Camera* cam, const sapp_event* ev) {
         }
     }
 
-    // Scroll wheel = speed adjustment
+    // Scroll wheel adjusts min_altitude (clearance above terrain)
     if (ev->type == SAPP_EVENTTYPE_MOUSE_SCROLL) {
-        cam->speed *= (ev->scroll_y > 0) ? 1.25f : 0.8f;
-        if (cam->speed < 1.0f) cam->speed = 1.0f;
-        if (cam->speed > 1e6f) cam->speed = 1e6f;
+        cam->min_altitude *= (ev->scroll_y > 0) ? 1.25f : 0.8f;
+        if (cam->min_altitude < 2.0f) cam->min_altitude = 2.0f;
+        if (cam->min_altitude > 10000.0f) cam->min_altitude = 10000.0f;
     }
 }

@@ -1,10 +1,16 @@
 #include "lod.h"
+#include "debug_log.h"
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
-#include <stdio.h>
 
-// Icosahedron base vertices
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#endif
+
+// ---- Icosahedron base geometry ----
+
 static const float ICO_VERTS[12][3] = {
     { 0.000f,  1.000f,  0.000f},
     { 0.894f,  0.447f,  0.000f},
@@ -20,7 +26,6 @@ static const float ICO_VERTS[12][3] = {
     { 0.000f, -1.000f,  0.000f},
 };
 
-// 20 triangular faces of the icosahedron
 static const int ICO_FACES[20][3] = {
     {0,2,1}, {0,3,2}, {0,4,3}, {0,5,4}, {0,1,5},
     {1,2,6}, {2,3,7}, {3,4,8}, {4,5,9}, {5,1,10},
@@ -32,302 +37,470 @@ static HMM_Vec3 ico_vert(int i) {
     return HMM_NormV3(HMM_V3(ICO_VERTS[i][0], ICO_VERTS[i][1], ICO_VERTS[i][2]));
 }
 
+// ---- Helper math ----
+
+static float vec3_dot(HMM_Vec3 a, HMM_Vec3 b) {
+    return a.X * b.X + a.Y * b.Y + a.Z * b.Z;
+}
+
+static HMM_Vec3 vec3_scale(HMM_Vec3 v, float s) {
+    return HMM_V3(v.X * s, v.Y * s, v.Z * s);
+}
+
+static HMM_Vec3 vec3_add(HMM_Vec3 a, HMM_Vec3 b) {
+    return HMM_V3(a.X + b.X, a.Y + b.Y, a.Z + b.Z);
+}
+
+static HMM_Vec3 vec3_sub(HMM_Vec3 a, HMM_Vec3 b) {
+    return HMM_V3(a.X - b.X, a.Y - b.Y, a.Z - b.Z);
+}
+
+static HMM_Vec3 vec3_normalize(HMM_Vec3 v) {
+    float len = sqrtf(v.X * v.X + v.Y * v.Y + v.Z * v.Z);
+    if (len < 1e-8f) return HMM_V3(0, 1, 0);
+    return HMM_V3(v.X / len, v.Y / len, v.Z / len);
+}
+
+static HMM_Vec3 vec3_cross(HMM_Vec3 a, HMM_Vec3 b) {
+    return HMM_V3(a.Y*b.Z - a.Z*b.Y, a.Z*b.X - a.X*b.Z, a.X*b.Y - a.Y*b.X);
+}
+
+static float clampf(float x, float lo, float hi) {
+    if (x < lo) return lo;
+    if (x > hi) return hi;
+    return x;
+}
+
+// ---- Node allocation ----
+
 static int alloc_node(LodTree* tree) {
     if (tree->node_count >= LOD_MAX_NODES) return -1;
     int idx = tree->node_count++;
     memset(&tree->nodes[idx], 0, sizeof(LodNode));
     tree->nodes[idx].parent = -1;
+    tree->nodes[idx].is_leaf = true;
     for (int i = 0; i < LOD_CHILDREN; i++) tree->nodes[idx].children[i] = -1;
     return idx;
 }
 
 static void free_node_gpu(LodNode* node) {
     if (node->gpu_valid) {
-        sg_destroy_buffer(node->vbuf);
-        sg_destroy_buffer(node->ibuf);
+        sg_destroy_buffer(node->gpu_buffer);
         node->gpu_valid = false;
+        node->gpu_vertex_count = 0;
     }
     free(node->vertices);
     node->vertices = NULL;
-    free(node->indices);
-    node->indices = NULL;
     node->vertex_count = 0;
-    node->index_count = 0;
     node->state = LOD_UNLOADED;
 }
 
-// Mesh generation job data (copied by value for thread safety)
+// ---- Distance metric (matches hex-planets) ----
+
+static float patch_center_distance(const LodTree* tree, const LodNode* node) {
+    float cam_r = sqrtf(vec3_dot(tree->camera_pos, tree->camera_pos));
+    if (cam_r < 1.0f) cam_r = 1.0f;
+    HMM_Vec3 cam_dir = vec3_scale(tree->camera_pos, 1.0f / cam_r);
+
+    float cos_angle = vec3_dot(cam_dir, node->tri.center);
+    cos_angle = clampf(cos_angle, -1.0f, 1.0f);
+    float angle_to_center = acosf(cos_angle);
+    float arc_dist = angle_to_center * tree->planet_radius;
+
+    // Altitude penalty prevents over-splitting from orbit
+    float max_surface_r = tree->planet_radius + TERRAIN_AMPLITUDE_M;
+    float altitude = cam_r - max_surface_r;
+    if (altitude < 0.0f) altitude = 0.0f;
+
+    return sqrtf(arc_dist * arc_dist + altitude * altitude);
+}
+
+// ---- Back-hemisphere culling ----
+
+static bool patch_on_back_hemisphere(const LodTree* tree, const LodNode* node) {
+    float cam_r = sqrtf(vec3_dot(tree->camera_pos, tree->camera_pos));
+    if (cam_r < 1.0f) return false;
+    HMM_Vec3 cam_dir = vec3_scale(tree->camera_pos, 1.0f / cam_r);
+    float horizon_angle = acosf(fminf(1.0f, tree->planet_radius / cam_r));
+    float cos_angle = vec3_dot(cam_dir, node->tri.center);
+    cos_angle = clampf(cos_angle, -1.0f, 1.0f);
+    float angle_to_center = acosf(cos_angle);
+    float nearest_angle = angle_to_center - node->tri.angular_radius;
+    return nearest_angle > ((float)M_PI / 2.0f + horizon_angle + 0.1f);
+}
+
+// ---- Split/merge decisions (matches hex-planets: 2x hysteresis) ----
+
+static bool should_split(const LodTree* tree, const LodNode* node) {
+    if (node->depth >= tree->max_depth_effective) return false;
+    // Don't split TO max depth (matches hex-planets)
+    if (node->depth + 1 >= tree->max_depth_effective) return false;
+    float dist = patch_center_distance(tree, node);
+    float patch_arc = tree->depth_arc[node->depth];
+    return dist < patch_arc * tree->split_factor;
+}
+
+static bool should_merge(const LodTree* tree, const LodNode* node) {
+    float dist = patch_center_distance(tree, node);
+    float patch_arc = tree->depth_arc[node->depth];
+    return dist > patch_arc * tree->split_factor * 2.0f;
+}
+
+// ---- Tessellation level per depth (matches hex-planets) ----
+
+static int tess_for_depth(int depth) {
+    if (depth >= 12) return 32;
+    if (depth >= 11) return 24;
+    if (depth >= 10) return 16;
+    if (depth >= 8)  return 8;
+    if (depth >= 4)  return 6;
+    return 4;
+}
+
+// ---- Mesh generation ----
+
 typedef struct {
     int node_idx;
     LodTree* tree;
     HMM_Vec3 v0, v1, v2;
+    int depth;
     float planet_radius;
     double world_origin[3];
     TerrainNoise terrain;
+    int seed;
+    // Result (written by worker, read by main thread)
+    LodVertex* result_verts;
+    int result_count;
+    volatile int completed;  // 0 = running, 1 = done
 } MeshGenJob;
 
-static HMM_Vec3 slerp_on_sphere(HMM_Vec3 a, HMM_Vec3 b, float t) {
-    float dot = HMM_DotV3(a, b);
-    if (dot > 0.9999f) {
-        // Nearly identical — lerp and normalize
-        HMM_Vec3 r = HMM_V3(a.X + (b.X - a.X) * t, a.Y + (b.Y - a.Y) * t, a.Z + (b.Z - a.Z) * t);
-        return HMM_NormV3(r);
-    }
-    float theta = acosf(dot < -1.0f ? -1.0f : (dot > 1.0f ? 1.0f : dot));
-    float sin_theta = sinf(theta);
-    float wa = sinf((1.0f - t) * theta) / sin_theta;
-    float wb = sinf(t * theta) / sin_theta;
-    return HMM_NormV3(HMM_V3(a.X * wa + b.X * wb, a.Y * wa + b.Y * wb, a.Z * wa + b.Z * wb));
-}
+#define MAX_PENDING_JOBS 256
+static MeshGenJob* g_pending_jobs[MAX_PENDING_JOBS];
+static int g_pending_job_count = 0;
 
 static void generate_mesh(void* data) {
     MeshGenJob* job = (MeshGenJob*)data;
-    LodTree* tree = job->tree;
-    LodNode* node = &tree->nodes[job->node_idx];
 
-    int n = LOD_VERTS_PER_EDGE;
-    int vert_count = (n * (n + 1)) / 2;
-    int tri_count = (n - 1) * (n - 1);
-    int idx_count = tri_count * 3;
+    int tess = tess_for_depth(job->depth);
+    int vert_per_row_sum = 0;
+    for (int r = 0; r <= tess; r++) vert_per_row_sum += (tess - r + 1);
+    int max_verts = vert_per_row_sum; // unique grid points
+    int max_tris = tess * tess;       // triangle count for tessellated triangle
+    int max_out = max_tris * 3;       // 3 verts per triangle (non-indexed)
 
-    LodVertex* verts = (LodVertex*)calloc(vert_count, sizeof(LodVertex));
-    uint16_t* indices = (uint16_t*)calloc(idx_count, sizeof(uint16_t));
+    // First pass: compute grid positions, normals (sphere direction), colors
+    HMM_Vec3* points = (HMM_Vec3*)calloc(max_verts, sizeof(HMM_Vec3));
+    HMM_Vec3* normals = (HMM_Vec3*)calloc(max_verts, sizeof(HMM_Vec3));
+    HMM_Vec3* colors = (HMM_Vec3*)calloc(max_verts, sizeof(HMM_Vec3));
 
-    // Generate vertices on the triangle (barycentric interpolation on sphere)
-    int vi = 0;
-    for (int row = 0; row < n; row++) {
-        float v = (float)row / (float)(n - 1);
-        HMM_Vec3 left = slerp_on_sphere(job->v0, job->v2, v);
-        HMM_Vec3 right = slerp_on_sphere(job->v1, job->v2, v);
-        int cols = n - row;
-        for (int col = 0; col < cols; col++) {
-            float u = (cols > 1) ? (float)col / (float)(cols - 1) : 0.0f;
-            HMM_Vec3 unit_pos = slerp_on_sphere(left, right, u);
+    int idx = 0;
+    for (int row = 0; row <= tess; row++) {
+        for (int col = 0; col <= tess - row; col++) {
+            float u = (float)col / (float)tess;
+            float v = (float)row / (float)tess;
+            float w = 1.0f - u - v;
 
-            // Sample terrain height
-            float height_m = terrain_sample_height_m(&job->terrain, unit_pos.X, unit_pos.Y, unit_pos.Z);
-            float radius = job->planet_radius + height_m;
+            // Barycentric interpolation on unit sphere
+            HMM_Vec3 p = vec3_add(vec3_add(
+                vec3_scale(job->v0, w),
+                vec3_scale(job->v1, u)),
+                vec3_scale(job->v2, v));
+            p = vec3_normalize(p);
 
-            // World position (relative to floating origin)
-            double wx = (double)unit_pos.X * (double)radius - job->world_origin[0];
-            double wy = (double)unit_pos.Y * (double)radius - job->world_origin[1];
-            double wz = (double)unit_pos.Z * (double)radius - job->world_origin[2];
+            // Sample terrain (matches hex-planets exactly)
+            float h_m = terrain_sample_height_m(&job->terrain, p.X, p.Y, p.Z);
+            // Effective height: clamp to sea level (water surface is flat)
+            float effective_h_m = h_m;
+            if (effective_h_m < TERRAIN_SEA_LEVEL_M) effective_h_m = TERRAIN_SEA_LEVEL_M;
+            float radius = job->planet_radius + effective_h_m;
 
-            verts[vi].pos[0] = (float)wx;
-            verts[vi].pos[1] = (float)wy;
-            verts[vi].pos[2] = (float)wz;
+            // World position relative to floating origin
+            double wx = (double)p.X * (double)radius - job->world_origin[0];
+            double wy = (double)p.Y * (double)radius - job->world_origin[1];
+            double wz = (double)p.Z * (double)radius - job->world_origin[2];
 
-            // Normal = unit sphere direction (approximate, good enough for planet scale)
-            verts[vi].normal[0] = unit_pos.X;
-            verts[vi].normal[1] = unit_pos.Y;
-            verts[vi].normal[2] = unit_pos.Z;
+            points[idx] = HMM_V3((float)wx, (float)wy, (float)wz);
+            normals[idx] = p;
 
-            // Compute slope from finite differences
-            float eps = 0.001f;
-            HMM_Vec3 dx_dir = HMM_NormV3(HMM_V3(unit_pos.X + eps, unit_pos.Y, unit_pos.Z));
-            HMM_Vec3 dy_dir = HMM_NormV3(HMM_V3(unit_pos.X, unit_pos.Y + eps, unit_pos.Z));
-            float hx = terrain_sample_height_m(&job->terrain, dx_dir.X, dx_dir.Y, dx_dir.Z);
-            float hy = terrain_sample_height_m(&job->terrain, dy_dir.X, dy_dir.Y, dy_dir.Z);
-            float slope = sqrtf((hx - height_m) * (hx - height_m) + (hy - height_m) * (hy - height_m)) / (eps * job->planet_radius);
-
-            // Biome color
-            HMM_Vec3 color = terrain_biome_color(height_m, slope);
-            verts[vi].color[0] = color.X;
-            verts[vi].color[1] = color.Y;
-            verts[vi].color[2] = color.Z;
-
-            vi++;
+            // Biome color from raw height + perturbation noise
+            HMM_Vec3 base_color = terrain_biome_color(h_m);
+            colors[idx] = terrain_perturb_color(base_color, &job->terrain, p.X, p.Y, p.Z);
+            idx++;
         }
     }
 
-    // Generate triangle indices
-    int ii = 0;
-    int row_start = 0;
-    for (int row = 0; row < n - 1; row++) {
-        int cols = n - row;
-        int next_row_start = row_start + cols;
-        for (int col = 0; col < cols - 1; col++) {
-            // Upward triangle
-            indices[ii++] = (uint16_t)(row_start + col);
-            indices[ii++] = (uint16_t)(row_start + col + 1);
-            indices[ii++] = (uint16_t)(next_row_start + col);
+    // Second pass: emit triangles (non-indexed, 3 verts per tri)
+    LodVertex* verts = (LodVertex*)calloc(max_out, sizeof(LodVertex));
+    int vi = 0;
 
-            // Downward triangle (if not last column in next row)
-            if (col < cols - 2) {
-                indices[ii++] = (uint16_t)(row_start + col + 1);
-                indices[ii++] = (uint16_t)(next_row_start + col + 1);
-                indices[ii++] = (uint16_t)(next_row_start + col);
+    // Build lookup table for grid row offsets
+    int* grid_offset = (int*)calloc(tess + 2, sizeof(int));
+    grid_offset[0] = 0;
+    for (int r = 0; r <= tess; r++) {
+        grid_offset[r + 1] = grid_offset[r] + (tess - r + 1);
+    }
+
+    // Emit triangle helper: writes 3 verts, checks winding against outward direction
+    #define EMIT_TRI(a, b, c) do { \
+        HMM_Vec3 pa = points[a], pb = points[b], pc = points[c]; \
+        HMM_Vec3 e1 = vec3_sub(pb, pa); \
+        HMM_Vec3 e2 = vec3_sub(pc, pa); \
+        HMM_Vec3 fn = vec3_cross(e1, e2); \
+        /* Face center direction (approximate outward) */ \
+        HMM_Vec3 fc = vec3_add(vec3_add(normals[a], normals[b]), normals[c]); \
+        /* If face normal points inward, swap b and c to fix winding */ \
+        int t0 = (a), t1 = (b), t2 = (c); \
+        if (vec3_dot(fn, fc) < 0.0f) { int tmp = t1; t1 = t2; t2 = tmp; } \
+        int tri_idx[3] = { t0, t1, t2 }; \
+        for (int k = 0; k < 3; k++) { \
+            int gi = tri_idx[k]; \
+            verts[vi].pos[0] = points[gi].X; \
+            verts[vi].pos[1] = points[gi].Y; \
+            verts[vi].pos[2] = points[gi].Z; \
+            verts[vi].normal[0] = normals[gi].X; \
+            verts[vi].normal[1] = normals[gi].Y; \
+            verts[vi].normal[2] = normals[gi].Z; \
+            verts[vi].color[0] = colors[gi].X; \
+            verts[vi].color[1] = colors[gi].Y; \
+            verts[vi].color[2] = colors[gi].Z; \
+            vi++; \
+        } \
+    } while(0)
+
+    for (int row = 0; row < tess; row++) {
+        int cols = tess - row;
+        for (int col = 0; col < cols; col++) {
+            int i0 = grid_offset[row] + col;
+            int i1 = grid_offset[row] + col + 1;
+            int i2 = grid_offset[row + 1] + col;
+
+            EMIT_TRI(i0, i1, i2);
+
+            if (col < cols - 1) {
+                int j0 = grid_offset[row] + col + 1;
+                int j1 = grid_offset[row + 1] + col + 1;
+                int j2 = grid_offset[row + 1] + col;
+                EMIT_TRI(j0, j1, j2);
             }
         }
-        row_start = next_row_start;
     }
+    #undef EMIT_TRI
 
-    node->vertices = verts;
-    node->vertex_count = vert_count;
-    node->indices = indices;
-    node->index_count = ii;
-    node->state = LOD_READY;
+    free(points);
+    free(normals);
+    free(colors);
+    free(grid_offset);
 
-    free(job);
+    // Store result in job (main thread will transfer to node)
+    job->result_verts = verts;
+    job->result_count = vi;
+    // Memory barrier: ensure result_verts/count are visible before completed flag
+#ifdef _WIN32
+    MemoryBarrier();
+#else
+    __sync_synchronize();
+#endif
+    job->completed = 1;
 }
 
 static void request_mesh(LodTree* tree, int node_idx) {
     LodNode* node = &tree->nodes[node_idx];
     if (node->state != LOD_UNLOADED) return;
+    if (g_pending_job_count >= MAX_PENDING_JOBS) return;
 
     MeshGenJob* job = (MeshGenJob*)calloc(1, sizeof(MeshGenJob));
     job->node_idx = node_idx;
     job->tree = tree;
-    job->v0 = node->v0;
-    job->v1 = node->v1;
-    job->v2 = node->v2;
+    job->v0 = node->tri.v0;
+    job->v1 = node->tri.v1;
+    job->v2 = node->tri.v2;
+    job->depth = node->depth;
     job->planet_radius = tree->planet_radius;
+    job->seed = tree->seed;
     memcpy(job->world_origin, tree->world_origin, sizeof(double) * 3);
     job->terrain = tree->terrain;
+    job->result_verts = NULL;
+    job->result_count = 0;
+    job->completed = 0;
 
+    g_pending_jobs[g_pending_job_count++] = job;
     node->state = LOD_GENERATING;
     job_system_submit(tree->jobs, generate_mesh, job);
 }
 
-static void upload_mesh(LodNode* node) {
-    if (node->state != LOD_READY || !node->vertices) return;
+// Process completed mesh gen jobs (main thread only — no data race)
+static void process_completed_jobs(void) {
+    int write = 0;
+    for (int i = 0; i < g_pending_job_count; i++) {
+        MeshGenJob* job = g_pending_jobs[i];
+        if (job->completed) {
+            LodNode* node = &job->tree->nodes[job->node_idx];
+            if (node->state == LOD_GENERATING) {
+                node->vertices = job->result_verts;
+                node->vertex_count = job->result_count;
+                node->state = LOD_READY;
+            } else {
+                // Node was invalidated (origin recenter) while generating
+                free(job->result_verts);
+            }
+            free(job);
+        } else {
+            g_pending_jobs[write++] = job;
+        }
+    }
+    g_pending_job_count = write;
+}
 
-    node->vbuf = sg_make_buffer(&(sg_buffer_desc){
+static void upload_mesh(LodNode* node) {
+    if (node->state != LOD_READY || !node->vertices || node->vertex_count <= 0) return;
+
+    node->gpu_buffer = sg_make_buffer(&(sg_buffer_desc){
         .data = { .ptr = node->vertices, .size = node->vertex_count * sizeof(LodVertex) },
         .label = "lod-vbuf",
     });
-    node->ibuf = sg_make_buffer(&(sg_buffer_desc){
-        .usage.index_buffer = true,
-        .data = { .ptr = node->indices, .size = node->index_count * sizeof(uint16_t) },
-        .label = "lod-ibuf",
-    });
     node->gpu_valid = true;
+    node->gpu_vertex_count = node->vertex_count;
     node->state = LOD_ACTIVE;
 
-    // Free CPU copies
     free(node->vertices);
     node->vertices = NULL;
-    free(node->indices);
-    node->indices = NULL;
 }
 
-// Aperture-4 subdivision: split triangle into 4 children
+// ---- Tree operations ----
+
+static void init_triangle(LodTriangle* tri, HMM_Vec3 v0, HMM_Vec3 v1, HMM_Vec3 v2) {
+    tri->v0 = v0;
+    tri->v1 = v1;
+    tri->v2 = v2;
+    tri->center = vec3_normalize(vec3_add(vec3_add(v0, v1), v2));
+    // Angular radius: max angle from center to any vertex
+    float a0 = acosf(clampf(vec3_dot(tri->center, v0), -1.0f, 1.0f));
+    float a1 = acosf(clampf(vec3_dot(tri->center, v1), -1.0f, 1.0f));
+    float a2 = acosf(clampf(vec3_dot(tri->center, v2), -1.0f, 1.0f));
+    tri->angular_radius = fmaxf(a0, fmaxf(a1, a2));
+}
+
 static void split_node(LodTree* tree, int node_idx) {
     LodNode* node = &tree->nodes[node_idx];
-    if (node->children[0] >= 0) return; // already split
+    if (!node->is_leaf) return;
     if (node->depth >= LOD_MAX_DEPTH) return;
 
-    HMM_Vec3 m01 = HMM_NormV3(HMM_MulV3F(HMM_AddV3(node->v0, node->v1), 0.5f));
-    HMM_Vec3 m12 = HMM_NormV3(HMM_MulV3F(HMM_AddV3(node->v1, node->v2), 0.5f));
-    HMM_Vec3 m02 = HMM_NormV3(HMM_MulV3F(HMM_AddV3(node->v0, node->v2), 0.5f));
+    HMM_Vec3 m01 = vec3_normalize(vec3_scale(vec3_add(node->tri.v0, node->tri.v1), 0.5f));
+    HMM_Vec3 m12 = vec3_normalize(vec3_scale(vec3_add(node->tri.v1, node->tri.v2), 0.5f));
+    HMM_Vec3 m02 = vec3_normalize(vec3_scale(vec3_add(node->tri.v0, node->tri.v2), 0.5f));
 
-    HMM_Vec3 child_tris[4][3] = {
-        { node->v0, m01, m02 },
-        { m01, node->v1, m12 },
-        { m02, m12, node->v2 },
-        { m01, m12, m02 },     // center triangle
+    HMM_Vec3 child_verts[4][3] = {
+        { node->tri.v0, m01, m02 },
+        { m01, node->tri.v1, m12 },
+        { m02, m12, node->tri.v2 },
+        { m01, m12, m02 },
     };
 
     for (int i = 0; i < LOD_CHILDREN; i++) {
         int ci = alloc_node(tree);
         if (ci < 0) return;
-        node = &tree->nodes[node_idx]; // re-fetch after potential realloc
+        node = &tree->nodes[node_idx]; // re-fetch
 
         LodNode* child = &tree->nodes[ci];
         child->parent = node_idx;
         child->depth = node->depth + 1;
-        child->v0 = child_tris[i][0];
-        child->v1 = child_tris[i][1];
-        child->v2 = child_tris[i][2];
-        child->center = HMM_NormV3(HMM_MulV3F(HMM_AddV3(HMM_AddV3(child->v0, child->v1), child->v2), 1.0f / 3.0f));
-        child->arc = acosf(HMM_DotV3(child->v0, child->v1));
-
+        child->is_leaf = true;
+        init_triangle(&child->tri, child_verts[i][0], child_verts[i][1], child_verts[i][2]);
         node->children[i] = ci;
     }
+    node->is_leaf = false;
 }
 
-static void merge_node(LodTree* tree, int node_idx) {
+static void merge_children(LodTree* tree, int node_idx) {
     LodNode* node = &tree->nodes[node_idx];
     for (int i = 0; i < LOD_CHILDREN; i++) {
         if (node->children[i] >= 0) {
-            merge_node(tree, node->children[i]);
+            merge_children(tree, node->children[i]);
             free_node_gpu(&tree->nodes[node->children[i]]);
+            tree->nodes[node->children[i]].is_leaf = true;
             node->children[i] = -1;
         }
     }
+    node->is_leaf = true;
 }
 
-static bool is_leaf(const LodNode* node) {
-    return node->children[0] < 0;
-}
+// ---- Update traversal ----
 
-static float node_distance(const LodNode* node, const float cam_pos[3], float planet_radius) {
-    // Distance from camera to patch center on sphere surface
-    float cx = node->center.X * planet_radius;
-    float cy = node->center.Y * planet_radius;
-    float cz = node->center.Z * planet_radius;
-    float dx = cx - cam_pos[0];
-    float dy = cy - cam_pos[1];
-    float dz = cz - cam_pos[2];
-    return sqrtf(dx * dx + dy * dy + dz * dz);
-}
-
-static void update_node(LodTree* tree, int node_idx, const float cam_pos[3]) {
+static void update_node(LodTree* tree, int node_idx) {
     LodNode* node = &tree->nodes[node_idx];
-    float dist = node_distance(node, cam_pos, tree->planet_radius);
-    float threshold = node->arc * tree->split_factor * tree->planet_radius;
 
-    if (is_leaf(node)) {
-        // Should we split?
-        if (dist < threshold && node->depth < LOD_MAX_DEPTH && tree->splits_this_frame < LOD_MAX_SPLITS) {
+    // Back-hemisphere culling: skip patches entirely behind planet
+    if (patch_on_back_hemisphere(tree, node)) return;
+
+    // Ensure this node has a mesh (for fallback rendering)
+    if (node->state == LOD_UNLOADED) {
+        request_mesh(tree, node_idx);
+    }
+    if (node->state == LOD_READY && tree->uploads_this_frame < LOD_MAX_UPLOADS) {
+        upload_mesh(node);
+        tree->uploads_this_frame++;
+    }
+
+    if (node->is_leaf) {
+        // Should we split? Only if this node has a GPU mesh (for fallback)
+        if (should_split(tree, node) && node->gpu_valid
+            && tree->splits_this_frame < LOD_MAX_SPLITS) {
             split_node(tree, node_idx);
             tree->splits_this_frame++;
-            // Request mesh for children
             node = &tree->nodes[node_idx]; // re-fetch
             for (int i = 0; i < LOD_CHILDREN; i++) {
-                if (node->children[i] >= 0) {
+                if (node->children[i] >= 0)
                     request_mesh(tree, node->children[i]);
-                }
-            }
-        } else {
-            // Ensure this leaf has a mesh
-            if (node->state == LOD_UNLOADED) {
-                request_mesh(tree, node_idx);
-            }
-            if (node->state == LOD_READY && tree->uploads_this_frame < LOD_MAX_UPLOADS) {
-                upload_mesh(node);
-                tree->uploads_this_frame++;
             }
         }
     } else {
         // Should we merge?
-        if (dist > threshold * 1.5f) {
-            merge_node(tree, node_idx);
-            // Re-request mesh for this node as a leaf
+        if (should_merge(tree, node)) {
+            merge_children(tree, node_idx);
             node = &tree->nodes[node_idx];
-            if (node->state == LOD_UNLOADED) {
+            if (node->state == LOD_UNLOADED)
                 request_mesh(tree, node_idx);
-            }
         } else {
             // Recurse into children
             for (int i = 0; i < LOD_CHILDREN; i++) {
-                if (node->children[i] >= 0) {
-                    update_node(tree, node->children[i], cam_pos);
-                }
+                if (node->children[i] >= 0)
+                    update_node(tree, node->children[i]);
             }
         }
     }
 }
 
+// ---- Public API ----
+
 void lod_tree_init(LodTree* tree, float planet_radius, int seed) {
     memset(tree, 0, sizeof(LodTree));
     tree->planet_radius = planet_radius;
+    tree->seed = seed;
     tree->split_factor = LOD_SPLIT_FACTOR;
+    // Without hex terrain, cap depth to avoid micro-patch explosion.
+    // Depth 10 ≈ 100m patches at 800km radius.
+    tree->max_depth_effective = 10;
 
-    // Precompute arc per depth
-    float base_arc = acosf(HMM_DotV3(ico_vert(ICO_FACES[0][0]), ico_vert(ICO_FACES[0][1])));
+    // Precompute arc per depth (average of root angular radii, halved each depth)
+    float avg_ar = 0.0f;
+
+    // Create root nodes first to compute average
+    for (int i = 0; i < LOD_ROOT_COUNT; i++) {
+        int ni = alloc_node(tree);
+        tree->roots[i] = ni;
+
+        LodNode* node = &tree->nodes[ni];
+        node->depth = 0;
+        init_triangle(&node->tri, ico_vert(ICO_FACES[i][0]),
+                      ico_vert(ICO_FACES[i][1]), ico_vert(ICO_FACES[i][2]));
+        avg_ar += node->tri.angular_radius;
+    }
+    avg_ar /= (float)LOD_ROOT_COUNT;
+
     for (int d = 0; d <= LOD_MAX_DEPTH; d++) {
-        tree->depth_arc[d] = base_arc / powf(2.0f, (float)d);
+        float ar = avg_ar;
+        for (int i = 0; i < d; i++) ar *= 0.5f;
+        tree->depth_arc[d] = ar * planet_radius;
     }
 
     // Init terrain
@@ -336,38 +509,78 @@ void lod_tree_init(LodTree* tree, float planet_radius, int seed) {
     // Create job system
     tree->jobs = job_system_create(LOD_NUM_WORKERS);
 
-    // Create root nodes from icosahedron faces
+    // Request meshes for all root nodes
     for (int i = 0; i < LOD_ROOT_COUNT; i++) {
-        int ni = alloc_node(tree);
-        tree->roots[i] = ni;
-
-        LodNode* node = &tree->nodes[ni];
-        node->depth = 0;
-        node->v0 = ico_vert(ICO_FACES[i][0]);
-        node->v1 = ico_vert(ICO_FACES[i][1]);
-        node->v2 = ico_vert(ICO_FACES[i][2]);
-        node->center = HMM_NormV3(HMM_MulV3F(HMM_AddV3(HMM_AddV3(node->v0, node->v1), node->v2), 1.0f / 3.0f));
-        node->arc = base_arc;
+        request_mesh(tree, tree->roots[i]);
     }
+
+    debug_log("LOD tree: %d roots, avg_ar=%.4f, depth_arc[0]=%.0f depth_arc[13]=%.2f",
+              LOD_ROOT_COUNT, (double)avg_ar,
+              (double)tree->depth_arc[0], (double)tree->depth_arc[13]);
 }
 
 void lod_tree_destroy(LodTree* tree) {
-    // Wait for pending jobs
     job_system_flush(tree->jobs);
-
     for (int i = 0; i < tree->node_count; i++) {
         free_node_gpu(&tree->nodes[i]);
     }
     job_system_destroy(tree->jobs);
 }
 
+bool lod_tree_update_origin(LodTree* tree, const double camera_pos_d[3]) {
+    double dx = camera_pos_d[0] - tree->world_origin[0];
+    double dy = camera_pos_d[1] - tree->world_origin[1];
+    double dz = camera_pos_d[2] - tree->world_origin[2];
+    double dist_sq = dx * dx + dy * dy + dz * dz;
+
+    if (dist_sq < ORIGIN_RECENTER_THRESHOLD * ORIGIN_RECENTER_THRESHOLD)
+        return false;
+
+    debug_log("Floating origin recenter: (%.0f,%.0f,%.0f) -> (%.0f,%.0f,%.0f)",
+              tree->world_origin[0], tree->world_origin[1], tree->world_origin[2],
+              camera_pos_d[0], camera_pos_d[1], camera_pos_d[2]);
+
+    tree->world_origin[0] = camera_pos_d[0];
+    tree->world_origin[1] = camera_pos_d[1];
+    tree->world_origin[2] = camera_pos_d[2];
+
+    // Wait for pending jobs to complete before invalidating
+    job_system_flush(tree->jobs);
+    process_completed_jobs();
+
+    // Destroy all node GPU buffers and CPU data
+    for (int i = 0; i < tree->node_count; i++) {
+        free_node_gpu(&tree->nodes[i]);
+    }
+
+    // Reset node pool and rebuild root nodes from scratch
+    tree->node_count = 0;
+    for (int i = 0; i < LOD_ROOT_COUNT; i++) {
+        int ni = alloc_node(tree);
+        tree->roots[i] = ni;
+        LodNode* node = &tree->nodes[ni];
+        node->depth = 0;
+        init_triangle(&node->tri, ico_vert(ICO_FACES[i][0]),
+                      ico_vert(ICO_FACES[i][1]), ico_vert(ICO_FACES[i][2]));
+        request_mesh(tree, ni);
+    }
+
+    return true;
+}
+
 void lod_tree_update(LodTree* tree, const double camera_pos_d[3]) {
-    // Camera position relative to world origin (float for LOD distance checks)
-    float cam_pos[3] = {
+    // Process completed mesh generation jobs FIRST (main thread, no race)
+    process_completed_jobs();
+
+    // Check floating origin recenter
+    lod_tree_update_origin(tree, camera_pos_d);
+
+    // Camera position relative to world origin
+    tree->camera_pos = HMM_V3(
         (float)(camera_pos_d[0] - tree->world_origin[0]),
         (float)(camera_pos_d[1] - tree->world_origin[1]),
-        (float)(camera_pos_d[2] - tree->world_origin[2]),
-    };
+        (float)(camera_pos_d[2] - tree->world_origin[2])
+    );
 
     tree->splits_this_frame = 0;
     tree->uploads_this_frame = 0;
@@ -382,7 +595,95 @@ void lod_tree_update(LodTree* tree, const double camera_pos_d[3]) {
 
     // Update LOD tree
     for (int i = 0; i < LOD_ROOT_COUNT; i++) {
-        update_node(tree, tree->roots[i], cam_pos);
+        update_node(tree, tree->roots[i]);
+    }
+
+    // Collect per-depth stats
+    memset(tree->level_stats, 0, sizeof(tree->level_stats));
+    for (int i = 0; i < tree->node_count; i++) {
+        LodNode* n = &tree->nodes[i];
+        if (n->is_leaf && n->gpu_valid && n->depth <= LOD_MAX_DEPTH) {
+            tree->level_stats[n->depth].patch_count++;
+            tree->level_stats[n->depth].vertex_count += n->gpu_vertex_count;
+        }
+    }
+}
+
+// ---- Rendering (recursive with parent fallback, matches hex-planets) ----
+
+// Per-frame render state
+static int g_draw_calls = 0;
+static int g_total_verts_drawn = 0;
+
+// Cached FS params (set once per frame, updated per-node for debug depth)
+static struct {
+    HMM_Vec4 sun_direction;
+    HMM_Vec4 camera_position;
+    HMM_Vec4 atmosphere_params;
+    HMM_Vec4 lod_debug;
+} g_fs_params;
+static bool g_debug_mode = false;
+
+static void draw_node(const LodNode* node) {
+    if (!node->gpu_valid || node->gpu_vertex_count <= 0) return;
+
+    // Per-node: update lod_debug.x with this node's depth
+    if (g_debug_mode) {
+        g_fs_params.lod_debug.X = (float)node->depth;
+        sg_apply_uniforms(1, &SG_RANGE(g_fs_params));
+    }
+
+    sg_bindings bind = {0};
+    bind.vertex_buffers[0] = node->gpu_buffer;
+    sg_apply_bindings(&bind);
+    sg_draw(0, node->gpu_vertex_count, 1);
+    g_draw_calls++;
+    g_total_verts_drawn += node->gpu_vertex_count;
+}
+
+// Check if a node can be rendered (has geometry on GPU), recursively
+static bool node_can_render(const LodTree* tree, const LodNode* node) {
+    // If this node itself has a GPU mesh, it can always render (as fallback or leaf)
+    if (node->gpu_valid && node->gpu_vertex_count > 0) return true;
+    // If it's a leaf with no mesh, it can't render
+    if (node->is_leaf) return false;
+    // Internal node without own mesh: check if ALL children can render
+    for (int i = 0; i < LOD_CHILDREN; i++) {
+        int ci = node->children[i];
+        if (ci < 0) return false;
+        if (!node_can_render(tree, &tree->nodes[ci])) return false;
+    }
+    return true;
+}
+
+static void render_node_recursive(const LodTree* tree, int node_idx) {
+    const LodNode* node = &tree->nodes[node_idx];
+
+    if (node->is_leaf) {
+        draw_node(node);
+        return;
+    }
+
+    // Check if ALL children can render (recursively — no holes)
+    bool all_children_renderable = true;
+    for (int i = 0; i < LOD_CHILDREN; i++) {
+        int ci = node->children[i];
+        if (ci < 0 || !node_can_render(tree, &tree->nodes[ci])) {
+            all_children_renderable = false;
+            break;
+        }
+    }
+
+    if (all_children_renderable) {
+        // All children can render: recurse into them
+        for (int i = 0; i < LOD_CHILDREN; i++) {
+            if (node->children[i] >= 0)
+                render_node_recursive(tree, node->children[i]);
+        }
+    } else {
+        // Children not all ready: render THIS node's mesh as fallback
+        // This is the key to zero-blink LOD — parent always covers while children load
+        draw_node(node);
     }
 }
 
@@ -393,46 +694,36 @@ void lod_tree_render(const LodTree* tree, sg_pipeline pip,
                      HMM_Vec4 atmos_params) {
     sg_apply_pipeline(pip);
 
-    for (int i = 0; i < tree->node_count; i++) {
-        const LodNode* node = &tree->nodes[i];
-        if (!node->gpu_valid) continue;
-        if (!is_leaf(node)) continue; // only render leaves
-        if (node->index_count <= 0) continue;
+    // Apply uniforms once (shared by all nodes)
+    struct {
+        HMM_Mat4 mvp;
+        HMM_Vec4 camera_offset;
+        HMM_Vec4 camera_offset_low;
+        HMM_Vec4 log_depth_param;
+    } vs_params = {
+        .mvp = view_proj,
+        .camera_offset = cam_offset,
+        .camera_offset_low = cam_offset_low,
+        .log_depth_param = log_depth,
+    };
+    sg_apply_uniforms(0, &SG_RANGE(vs_params));
 
-        // Validate buffer handles before binding
-        if (node->vbuf.id == 0 || node->ibuf.id == 0) continue;
+    // Cache FS params for per-node debug updates
+    g_fs_params.sun_direction = sun_dir;
+    g_fs_params.camera_position = cam_pos;
+    g_fs_params.atmosphere_params = atmos_params;
+    g_fs_params.lod_debug = HMM_V4(0.0f, (float)tree->max_depth_effective, 0.0f, 0.0f);
+    g_debug_mode = tree->show_lod_debug;
 
-        sg_bindings bind = {0};
-        bind.vertex_buffers[0] = node->vbuf;
-        bind.index_buffer = node->ibuf;
-        sg_apply_bindings(&bind);
+    sg_apply_uniforms(1, &SG_RANGE(g_fs_params));
 
-        // VS uniforms
-        struct {
-            HMM_Mat4 mvp;
-            HMM_Vec4 camera_offset;
-            HMM_Vec4 camera_offset_low;
-            HMM_Vec4 log_depth_param;
-        } vs_params = {
-            .mvp = view_proj,
-            .camera_offset = cam_offset,
-            .camera_offset_low = cam_offset_low,
-            .log_depth_param = log_depth,
-        };
-        sg_apply_uniforms(0, &SG_RANGE(vs_params));
+    g_draw_calls = 0;
+    g_total_verts_drawn = 0;
 
-        // FS uniforms
-        struct {
-            HMM_Vec4 sun_direction;
-            HMM_Vec4 camera_position;
-            HMM_Vec4 atmosphere_params;
-        } fs_params = {
-            .sun_direction = sun_dir,
-            .camera_position = cam_pos,
-            .atmosphere_params = atmos_params,
-        };
-        sg_apply_uniforms(1, &SG_RANGE(fs_params));
-
-        sg_draw(0, node->index_count, 1);
+    for (int i = 0; i < LOD_ROOT_COUNT; i++) {
+        render_node_recursive(tree, tree->roots[i]);
     }
+
+    ((LodTree*)tree)->active_leaf_count = g_draw_calls;
+    ((LodTree*)tree)->total_vertex_count = g_total_verts_drawn;
 }
